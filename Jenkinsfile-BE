@@ -1,0 +1,211 @@
+pipeline {
+    agent none
+    environment {
+        PROJECT_USER = 'wineapp'
+        BE_PORT = '4000:8080'
+        BE_HOST = 'http://192.168.181.102:4000'
+    }
+    stages {
+        stage('Checkout Git') {
+            agent {
+                label 'Build-Server'
+            }
+            steps {
+                checkout scm
+                script {
+                    env.PROJECT_NAME = env.JOB_BASE_NAME.toLowerCase()
+                    env.SNYK_SECURITY_SCAN_REPORT = "SNYK_SECURITY_SCAN_REPORT_${PROJECT_NAME}_${env.GIT_COMMIT?.substring(0, 6)}"
+                    env.IMAGE_VERSION = "${PORTUS_URL}/${PROJECT_USER}/${PROJECT_NAME}:${env.GIT_COMMIT?.substring(0, 6)}"
+                    env.TRIVYFS_SCAN_IMAGE_REPORT = "TRIVYFS_SCAN_IMAGE_REPORT_${PROJECT_NAME}_${env.GIT_COMMIT?.substring(0, 6)}"
+                    env.ARACHNI_WEBSITE_REPORT = "ARACHNI_WEBSITE_REPORT_${PROJECT_NAME}_${env.GIT_COMMIT?.substring(0, 6)}"
+                    env.K6_PERFORMANCE_TEST_REPORT = "K6_PERFORMANCE_TEST_REPORT_${PROJECT_NAME}_${env.GIT_COMMIT?.substring(0, 6)}"
+                }
+            }
+        }
+        stage('Code Security Scan') {
+            agent {
+                label 'Build-Server'
+            }
+            steps {
+                withCredentials([string(credentialsId: 'SNYK_API_TOKEN', variable: 'SNYK_API_TOKEN')]) {
+                    script {
+                        sh 'snyk auth ${SNYK_API_TOKEN}'
+                        sh """
+                            snyk test --json | snyk-to-html -o ${SNYK_SECURITY_SCAN_REPORT}.html || true
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${SNYK_SECURITY_SCAN_REPORT}.html", allowEmptyArchive: true
+                }
+            }
+        }
+        stage('Build') {
+            agent {
+                label 'Build-Server'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'PORTUS_CREDENTIALS', usernameVariable: 'PORTUS_USER', passwordVariable: 'PORTUS_PASSWORD')]) {
+                    script {
+                        sh 'docker login -u ${PORTUS_USER} -p ${PORTUS_PASSWORD} ${PORTUS_URL}'
+                        sh 'docker build -t ${IMAGE_VERSION} .'
+                    }
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout ${PORTUS_URL}'
+                }
+            }
+        }
+        stage('Trivy Scan Image') {
+            agent {
+                label 'Build-Server'
+            }
+            steps {
+                script {
+                    sh 'docker run --rm -v $(pwd):/${PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy clean --all'
+                    sh 'docker run --rm -v $(pwd):/${PROJECT_NAME} -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image --format template --template "@contrib/html.tpl" --output /${PROJECT_NAME}/${TRIVYFS_SCAN_IMAGE_REPORT}.html ${IMAGE_VERSION}'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${TRIVYFS_SCAN_IMAGE_REPORT}.html", allowEmptyArchive: true
+                }
+            }
+        }
+        stage('Send Reports From Build Server') {
+            agent {
+                label 'Build-Server'
+            }
+            steps {
+                withCredentials([string(credentialsId: 'TELE_GROUP_CHAT_ID', variable: 'TELE_GROUP_CHAT_ID'), string(credentialsId: 'API_BOT', variable: 'API_BOT')]) {
+                    script {
+                        sh 'curl -F "chat_id=${TELE_GROUP_CHAT_ID}" -F \'media=[{"type":"document","media":"attach://file1"}, {"type":"document","media":"attach://file2"}]\' -F "file1=@$(pwd)/${SNYK_SECURITY_SCAN_REPORT}.html" -F "file2=@$(pwd)/${TRIVYFS_SCAN_IMAGE_REPORT}.html" "https://api.telegram.org/bot${API_BOT}/sendMediaGroup"'
+                    }
+                }
+            }
+        }
+        stage('Push') {
+            agent {
+                label 'Build-Server'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'PORTUS_CREDENTIALS', usernameVariable: 'PORTUS_USER', passwordVariable: 'PORTUS_PASSWORD')]) {
+                    script {
+                        sh 'docker login -u ${PORTUS_USER} -p ${PORTUS_PASSWORD} ${PORTUS_URL}'
+                        sh 'docker push ${IMAGE_VERSION}'
+                    }
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout ${PORTUS_URL}'
+                }
+            }
+        }
+        stage('Deploy') {
+            agent {
+                label 'Development-Server'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'PORTUS_CREDENTIALS', usernameVariable: 'PORTUS_USER', passwordVariable: 'PORTUS_PASSWORD')]) {
+                    script {
+                        sh 'docker login -u ${PORTUS_USER} -p ${PORTUS_PASSWORD} ${PORTUS_URL}'
+                        sh 'sudo su ${PROJECT_USER} -c "docker pull ${IMAGE_VERSION}; docker rm -f ${PROJECT_NAME}; docker run --name ${PROJECT_NAME} -dp ${BE_PORT} ${IMAGE_VERSION}"'
+                    }
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout ${PORTUS_URL}'
+                }
+            }
+        }
+        stage('Security Scan Website') {
+            agent {
+                label 'Development-Server'
+            }
+            environment {
+                ARACHNI_USER = 'arachni'
+                PATH_TO_ARACHNI_VERSION = '/home/arachni/arachni-1.6.1.3-0.6.1.1/'
+            }
+            steps {
+                script {
+                    sh 'sudo su ${ARACHNI_USER} -c "cd ${PATH_TO_ARACHNI_VERSION}; bin/arachni --output-verbose --scope-include-subdomains ${BE_HOST} --report-save-path=/tmp/${ARACHNI_WEBSITE_REPORT}.afr > /dev/null 2>&1"'
+                    sh 'sudo su ${ARACHNI_USER} -c "cd ${PATH_TO_ARACHNI_VERSION}; bin/arachni_reporter /tmp/${ARACHNI_WEBSITE_REPORT}.afr --reporter=html:outfile=/tmp/${ARACHNI_WEBSITE_REPORT}.html.zip"'
+                    sh 'sudo chmod 777 /tmp/${ARACHNI_WEBSITE_REPORT}.html.zip'
+                    sh 'cp /tmp/${ARACHNI_WEBSITE_REPORT}.html.zip .'
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${ARACHNI_WEBSITE_REPORT}.html.zip", allowEmptyArchive: true
+                }
+            }
+        }
+        stage('Performance Testing') {
+            agent {
+                label 'Development-Server'
+            }
+            environment {
+                SCRIPT_PATH = 'performance_testing_script'
+                ID_USER_JENKINS_AGENT = '1003'
+                ID_GROUP_JENKINS_AGENT = '1003'
+            }
+            steps {
+                script {
+                    sh 'sudo chmod -R 754 ./${SCRIPT_PATH}'
+                    sh 'docker run --user ${ID_USER_JENKINS_AGENT}:${ID_GROUP_JENKINS_AGENT} --rm -v $(pwd)/${SCRIPT_PATH}:/${SCRIPT_PATH} grafana/k6 run -e BE_HOST=${BE_HOST} --summary-export=/${SCRIPT_PATH}/summary_perf.json /${SCRIPT_PATH}/load_test.js'
+                    sh 'docker run --user ${ID_USER_JENKINS_AGENT}:${ID_GROUP_JENKINS_AGENT} --rm -v $(pwd)/${SCRIPT_PATH}:/${SCRIPT_PATH} grafana/k6 run -e BE_HOST=${BE_HOST} /${SCRIPT_PATH}/load_test.js'
+                    sh 'mv ./${SCRIPT_PATH}/summary.html ${K6_PERFORMANCE_TEST_REPORT}.html'
+                    sh """
+                        cat ./${SCRIPT_PATH}/summary_perf.json | jq -r '[
+                            "metric", "avg", "min", "med", "max", "p(90)", "p(95)"
+                        ], 
+                        (.metrics | to_entries[] | [
+                            .key, 
+                            .value.avg, 
+                            .value.min, 
+                            .value.med, 
+                            .value.max, 
+                            .value["p(90)"], 
+                            .value["p(95)"]
+                        ]) | @csv' > ${K6_PERFORMANCE_TEST_REPORT}.csv
+                    """
+
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${K6_PERFORMANCE_TEST_REPORT}.html, ${K6_PERFORMANCE_TEST_REPORT}.csv", allowEmptyArchive: true
+                }
+            }
+        }
+        stage('Send Reports From Depvelopment Server') {
+            agent {
+                label 'Development-Server'
+            }
+            steps {
+                withCredentials([string(credentialsId: 'TELE_GROUP_CHAT_ID', variable: 'TELE_GROUP_CHAT_ID'), string(credentialsId: 'API_BOT', variable: 'API_BOT')]) {
+                    script {
+                        sh 'curl -F "chat_id=${TELE_GROUP_CHAT_ID}" -F \'media=[{"type":"document","media":"attach://file1"}, {"type":"document","media":"attach://file2"}, {"type":"document","media":"attach://file3"}]\' -F "file1=@$(pwd)/${ARACHNI_WEBSITE_REPORT}.html.zip" -F "file2=@$(pwd)/${K6_PERFORMANCE_TEST_REPORT}.html" -F "file3=@$(pwd)/${K6_PERFORMANCE_TEST_REPORT}.csv" "https://api.telegram.org/bot${API_BOT}/sendMediaGroup"'
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            node('Build-Server') {
+                cleanWs()
+            }
+            node('Development-Server') {
+                cleanWs()
+            }
+        }
+    }
+}
+
